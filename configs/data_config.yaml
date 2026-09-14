@@ -1,0 +1,46 @@
+# v1.0 - schema与数据
+# 数据配置：描述数据来源、schema 字段规则、以及 bad case 样例。
+
+schema_name: "video_action_understanding"
+version: "1.0.0"
+
+# 公开数据集来源（建议 < 30 clips，用于控制 API 成本）
+data_sources:
+  - name: "something_something_v2"
+    url: "https://20bn.com/datasets/something-something/v2"
+    note: "动作理解短视频，适合验证 verb+noun 标注"
+  - name: "epic_kitchens_100"
+    url: "https://epic-kitchens.github.io/2021"
+    note: "第一人称厨房操作视频，适合对象-动作关系标注"
+
+clip_constraints:
+  max_clips_for_testing: 30
+  max_duration_sec: 10.0
+  target_fps_for_extraction: 1
+
+required_fields:
+  - clip_id
+  - duration_sec
+  - description
+  - actions
+  - overall_confidence
+
+optional_fields:
+  - scene_context
+  - relationships
+  - objects[].bbox
+  - objects[].attributes
+
+# 验证器阈值（Stop Arbiter 会引用这些值）
+thresholds:
+  coverage: 0.95
+  consistency: 0.90
+  plausibility: 0.85
+  max_turns: 3
+
+# 用于 Milestone 1 的本地样本文件名
+sample_files:
+  good: "data/sample_annotation_good.json"
+  bad_missing_field: "data/sample_annotation_bad_missing.json"
+  bad_inconsistent: "data/sample_annotation_bad_inconsistent.json"
+  bad_implausible: "data/sample_annotation_bad_implausible.json"

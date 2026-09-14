@@ -1,0 +1,24 @@
+{
+  "clip_id": "ssv2_bad_002",
+  "duration_sec": 3.0,
+  "description": "",
+  "scene_context": "厨房",
+  "objects": [
+    {
+      "object_id": "obj_001",
+      "name": "刀",
+      "category": "厨具"
+    }
+  ],
+  "actions": [
+    {
+      "action_id": "act_001",
+      "verb": "cut",
+      "noun": "面包",
+      "segment": {"start_sec": 0.0, "end_sec": 3.5},
+      "involved_object_ids": ["obj_001"],
+      "confidence": 0.85
+    }
+  ],
+  "overall_confidence": 0.85
+}

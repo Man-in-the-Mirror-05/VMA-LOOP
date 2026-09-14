@@ -1,0 +1,38 @@
+# Secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.conda/
+
+# Caches & logs
+.pytest_cache/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Outputs & local data
+outputs/
+outputs_*/
+data/clips/*
+!data/clips/.gitkeep
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,34 @@
+{
+  "clip_id": "ssv2_0001",
+  "duration_sec": 4.0,
+  "description": "一个人将杯子里的水倒进碗里",
+  "scene_context": "厨房台面",
+  "objects": [
+    {
+      "object_id": "obj_001",
+      "name": "杯子",
+      "category": "容器",
+      "attributes": {"contains": "water"}
+    },
+    {
+      "object_id": "obj_002",
+      "name": "碗",
+      "category": "容器"
+    }
+  ],
+  "actions": [
+    {
+      "action_id": "act_001",
+      "verb": "pour",
+      "noun": "water",
+      "subject": "人",
+      "segment": {"start_sec": 1.0, "end_sec": 3.5},
+      "involved_object_ids": ["obj_001", "obj_002"],
+      "confidence": 0.92
+    }
+  ],
+  "relationships": [
+    {"type": "spatial", "from": "obj_001", "to": "obj_002", "relation": "above"}
+  ],
+  "overall_confidence": 0.90
+}

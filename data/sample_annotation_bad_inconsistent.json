@@ -1,0 +1,20 @@
+{
+  "clip_id": "ssv2_bad_001",
+  "duration_sec": 4.0,
+  "description": "一个人拿起杯子",
+  "scene_context": null,
+  "objects": [],
+  "actions": [
+    {
+      "action_id": "act_001",
+      "verb": "hold",
+      "noun": "杯子",
+      "subject": "人",
+      "segment": {"start_sec": 0.5, "end_sec": 2.0},
+      "involved_object_ids": ["obj_missing"],
+      "confidence": 0.88
+    }
+  ],
+  "relationships": [],
+  "overall_confidence": 0.88
+}
