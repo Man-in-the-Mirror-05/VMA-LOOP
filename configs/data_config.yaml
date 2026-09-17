@@ -5,18 +5,25 @@ schema_name: "video_action_understanding"
 version: "1.0.0"
 
 # 公开数据集来源（建议 < 30 clips，用于控制 API 成本）
+# 已接入自动下载：LeRobot 真机机器人操作数据集（经 hf-mirror.com 访问）
+# 注意命名区分：aloha_sim_* 为 MuJoCo 仿真，aloha_static_* / aloha_mobile_* 为真机采集
 data_sources:
+  - name: "lerobot/aloha_static_battery"
+    url: "https://huggingface.co/datasets/lerobot/aloha_static_battery"
+    note: "ALOHA 真机双臂遥操作：把电池放入遥控器卡槽，已接入自动下载"
+  - name: "lerobot/aloha_static_coffee"
+    url: "https://huggingface.co/datasets/lerobot/aloha_static_coffee"
+    note: "ALOHA 真机双臂遥操作，备选任务源"
   - name: "something_something_v2"
     url: "https://20bn.com/datasets/something-something/v2"
-    note: "动作理解短视频，适合验证 verb+noun 标注"
-  - name: "epic_kitchens_100"
-    url: "https://epic-kitchens.github.io/2021"
-    note: "第一人称厨房操作视频，适合对象-动作关系标注"
+    note: "需 Qualcomm 官网注册，暂未接入自动路径"
 
 clip_constraints:
   max_clips_for_testing: 30
-  max_duration_sec: 10.0
+  # ALOHA 真机 episode 长 10-15 秒，上限从 10.0 放宽到 15.0 以保留完整动作
+  max_duration_sec: 15.0
   target_fps_for_extraction: 1
+  clip_output_fps: 10.0
 
 required_fields:
   - clip_id

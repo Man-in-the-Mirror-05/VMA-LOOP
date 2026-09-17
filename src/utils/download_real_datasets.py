@@ -1,21 +1,26 @@
 """
 真实开源视频数据集下载脚本。
 
-当前环境限制说明：
-- HuggingFace Hub 无法直接访问（已尝试 hf-mirror.com）
-- UCF101 完整包 6.5GB，不适合本机直接下载
-- Something-Something V2 / Epic-Kitchens-100 / Ego4D 需要官网注册
+自动下载源（已验证可用）：
+- LeRobot 真实机器人操作数据集（HuggingFace，经 hf-mirror.com 镜像访问）
+  默认 lerobot/aloha_static_battery：ALOHA 真机双臂遥操作，任务为
+  "Place the battery into the slot of the remote controller."
+  同类可选：aloha_static_coffee / aloha_static_candy / aloha_static_tape /
+            aloha_static_ziploc_slide / aloha_static_towel 等。
+  注意区分命名：aloha_sim_* 为 MuJoCo 仿真，aloha_static_* 与 aloha_mobile_*
+  为真机采集，本项目只取真机数据。
 
-本脚本提供三种获取真实数据的路径：
-1. 用户手动下载 SSv2 / Epic-Kitchens / UCF101 子集后，用本脚本解压/重采样为 MP4
-2. 提供阿里云盘/百度网盘分享链接时，用本脚本整理为统一格式
-3. 作为 fallback，调用 generate_realistic_robot_clips.py 生成高保真合成视频
+仍需手动下载的源（自动路径已确认不可行）：
+- Something-Something V2：需 Qualcomm 官网注册，19 个分卷约 19.4GB
+- Epic-Kitchens-100 / Ego4D：需注册申请，数据量极大
 
-推荐的真实数据集（按与机器人操作相关度排序）：
-- Something-Something V2：人手-物体交互短视频，最接近机器人操作预训练数据
-- Epic-Kitchens-100：第一人称厨房操作视频
-- Ego4D：大规模第一人称视频，包含大量操作行为
-- UCF101：通用动作识别数据集，部分类别涉及物体操作
+LeRobot v3 数据集结构：
+  meta/info.json                           fps、视频键、路径模板
+  meta/episodes/chunk-*/file-*.parquet     每条 episode 的起止时间戳与任务描述
+  videos/{video_key}/chunk-*/file-*.mp4    多个 episode 拼接在同一 mp4 中
+
+因此取真实片段的做法是：先读 episodes parquet 拿到每条 episode 在视频中的
+[from_timestamp, to_timestamp)，再按帧号切出独立 clip。
 """
 
 from __future__ import annotations
@@ -24,282 +29,447 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
-import tempfile
-import zipfile
+import urllib.error
+import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse
+
+import cv2
+import yaml
+
+HF_MIRROR = "https://hf-mirror.com"
+DEFAULT_REPO = "lerobot/aloha_static_battery"
+
+# ---------------------------------------------------------------------------
+# 通用下载工具
+# ---------------------------------------------------------------------------
 
 
-SUPPORTED_SOURCES = {
-    "something_something_v2": {
-        "display_name": "Something-Something V2 (SSv2)",
-        "url": "https://20bn.com/datasets/something-something/v2",
-        "note": "需注册后下载，validation 集约 1.6GB",
-        "recommended": True,
-    },
-    "epic_kitchens_100": {
-        "display_name": "Epic-Kitchens-100",
-        "url": "https://epic-kitchens.github.io/2021",
-        "note": "需注册后下载，clip 包约 80GB（建议只下载子集）",
-        "recommended": False,
-    },
-    "ego4d": {
-        "display_name": "Ego4D",
-        "url": "https://ego4d-data.org/",
-        "note": "需注册并申请，数据量极大",
-        "recommended": False,
-    },
-    "ucf101": {
-        "display_name": "UCF101",
-        "url": "https://www.crcv.ucf.edu/data/UCF101/UCF101.rar",
-        "note": "6.5GB，可直接下载但较大；推荐只选 20 个动作类",
-        "recommended": False,
-    },
-}
+def ensure_hf_endpoint() -> str:
+    """统一 HF 端点，默认走 hf-mirror.com。"""
+    endpoint = os.environ.get("HF_ENDPOINT") or HF_MIRROR
+    os.environ["HF_ENDPOINT"] = endpoint
+    return endpoint.rstrip("/")
+
+
+def resolve_url(repo: str, path: str, repo_type: str = "datasets") -> str:
+    endpoint = ensure_hf_endpoint()
+    return f"{endpoint}/{repo_type}/{repo}/resolve/main/{path}"
+
+
+def api_url(repo: str, path: str = "", repo_type: str = "datasets") -> str:
+    endpoint = ensure_hf_endpoint()
+    suffix = f"/{path}" if path else ""
+    return f"{endpoint}/api/{repo_type}/{repo}{suffix}"
+
+
+def download_file(url: str, dst: Path, retries: int = 3, timeout: int = 120) -> Path:
+    """流式下载，带重试，已存在且非空则跳过。"""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() and dst.stat().st_size > 0:
+        print(f"[SKIP] 已存在 {dst.name} ({dst.stat().st_size} bytes)")
+        return dst
+
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "vma-loop/1.0"})
+            tmp = dst.with_suffix(dst.suffix + ".part")
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or 0)
+                got = 0
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if total and got % (10 * 1024 * 1024) < 1024 * 1024:
+                        print(f"    {dst.name}: {got/1048576:.0f}/{total/1048576:.0f} MB")
+            tmp.replace(dst)
+            print(f"[OK] {dst.name} ({dst.stat().st_size} bytes)")
+            return dst
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+            last_err = e
+            print(f"[RETRY {attempt}/{retries}] {dst.name}: {e}")
+    raise RuntimeError(f"下载失败 {url}: {last_err}")
+
+
+def http_get_json(url: str, timeout: int = 60):
+    req = urllib.request.Request(url, headers={"User-Agent": "vma-loop/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8-sig"))
+
+
+# ---------------------------------------------------------------------------
+# LeRobot 真机数据集
+# ---------------------------------------------------------------------------
+
+
+def _pick_video_key(features: dict) -> str:
+    """选择作为标注输入的主视角视频键。"""
+    video_keys = [k for k, v in features.items() if v.get("dtype") == "video"]
+    if not video_keys:
+        raise RuntimeError("数据集中没有任何 video 特征")
+    for preferred in ("observation.images.cam_high", "observation.images.top", "observation.image"):
+        if preferred in video_keys:
+            return preferred
+    return sorted(video_keys)[0]
+
+
+def _list_episode_parquets(repo: str) -> list[str]:
+    """列出 meta/episodes 下的所有 parquet。"""
+    try:
+        entries = http_get_json(api_url(repo, "tree/main/meta/episodes?recursive=true"))
+        paths = [e["path"] for e in entries if e.get("type") == "file" and e["path"].endswith(".parquet")]
+        if paths:
+            return sorted(paths)
+    except Exception as e:
+        print(f"[WARN] 列举 episodes 失败，回退到默认路径: {e}")
+    return ["meta/episodes/chunk-000/file-000.parquet"]
+
+
+def _read_episodes(repo: str, cache_dir: Path) -> tuple[list[dict], dict]:
+    """下载并解析 episodes 元数据，返回 (episodes, info)。"""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError(f"需要 pyarrow 读取 episodes 元数据: {e}")
+
+    info = http_get_json(resolve_url(repo, "meta/info.json"))
+    video_key = _pick_video_key(info["features"])
+    fps = float(info["features"][video_key]["video_info"]["video.fps"])
+
+    episodes: list[dict] = []
+    for rel in _list_episode_parquets(repo):
+        # 缓存名必须带仓库前缀：不同仓库的 episodes 文件同名（都是 file-000.parquet）
+        local = cache_dir / f"{repo.split('/')[-1]}-{Path(rel).name}"
+        download_file(resolve_url(repo, rel), local)
+        table = pq.read_table(local)
+        cols = [
+            "episode_index",
+            f"videos/{video_key}/chunk_index",
+            f"videos/{video_key}/file_index",
+            f"videos/{video_key}/from_timestamp",
+            f"videos/{video_key}/to_timestamp",
+            "tasks",
+            "length",
+        ]
+        present = [c for c in cols if c in table.column_names]
+        for row in table.select(present).to_pylist():
+            tasks = row.get("tasks") or []
+            episodes.append(
+                {
+                    "episode_index": int(row["episode_index"]),
+                    "chunk_index": int(row[f"videos/{video_key}/chunk_index"]),
+                    "file_index": int(row[f"videos/{video_key}/file_index"]),
+                    "from_sec": float(row[f"videos/{video_key}/from_timestamp"]),
+                    "to_sec": float(row[f"videos/{video_key}/to_timestamp"]),
+                    "length": int(row.get("length") or 0),
+                    "task": tasks[0] if tasks else "",
+                }
+            )
+    episodes.sort(key=lambda e: e["episode_index"])
+    meta = {"repo": repo, "video_key": video_key, "fps": fps, "total_episodes": len(episodes)}
+    return episodes, meta
+
+
+def _cut_clip(
+    src: Path,
+    dst: Path,
+    start_frame: int,
+    end_frame: int,
+    out_fps: float,
+    src_fps: float,
+) -> float:
+    """按帧区间切出 clip，按 out_fps 抽帧，返回实际时长（秒）。"""
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频: {src}")
+    if start_frame > 0:
+        # 直接定位到起始帧，避免从头解码整个视频
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_frame))
+
+    writer = None
+    frame_idx = start_frame
+    kept = 0
+    step = max(1, int(round(src_fps / out_fps)))
+    try:
+        while frame_idx < end_frame:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_idx >= start_frame and (frame_idx - start_frame) % step == 0:
+                if writer is None:
+                    h, w = frame.shape[:2]
+                    writer = cv2.VideoWriter(
+                        str(dst), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (w, h)
+                    )
+                    if not writer.isOpened():
+                        raise RuntimeError(f"无法创建输出视频: {dst}")
+                writer.write(frame)
+                kept += 1
+            frame_idx += 1
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+
+    if kept == 0:
+        raise RuntimeError(f"未写出任何帧: {dst}")
+    return kept / out_fps
+
+
+def fetch_lerobot_clips(
+    repos: list[str] | str = DEFAULT_REPO,
+    out_dir: str | Path = "data/clips",
+    max_clips: int = 20,
+    max_duration: float = 15.0,
+    out_fps: float = 10.0,
+) -> list[dict]:
+    """从多个 LeRobot 真机数据集各切若干 episode，组成多任务 clip 集。"""
+    import math
+
+    if isinstance(repos, str):
+        repos = [r.strip() for r in repos.split(",") if r.strip()]
+    out_dir = Path(out_dir)
+    root = out_dir.parent
+    cache_dir = root / "_real_cache"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    per_repo = max(1, math.ceil(max_clips / len(repos)))
+    records: list[dict] = []
+
+    for repo in repos:
+        if len(records) >= max_clips:
+            break
+        print(f"\n[LeRobot] 数据源 {repo}（本仓库配额 {per_repo} 条）")
+        try:
+            episodes, meta = _read_episodes(repo, cache_dir)
+        except Exception as e:
+            print(f"[WARN] 跳过 {repo}: {e}")
+            continue
+        print(
+            f"[LeRobot] {meta['total_episodes']} 条 episode，"
+            f"主视角 {meta['video_key']}，源 {meta['fps']} fps"
+        )
+
+        video_cache: dict[int, Path] = {}
+        taken = 0
+        for ep in episodes:
+            if len(records) >= max_clips or taken >= per_repo:
+                break
+            start_sec, end_sec = ep["from_sec"], ep["to_sec"]
+            if end_sec - start_sec > max_duration:
+                end_sec = start_sec + max_duration
+
+            file_index = ep["file_index"]
+            if file_index not in video_cache:
+                rel = (
+                    f"videos/{meta['video_key']}/chunk-{ep['chunk_index']:03d}/"
+                    f"file-{file_index:03d}.mp4"
+                )
+                video_cache[file_index] = download_file(
+                    resolve_url(repo, rel), cache_dir / f"{repo.split('/')[-1]}-{Path(rel).name}",
+                    timeout=900,
+                )
+            src_video = video_cache[file_index]
+
+            clip_id = f"real_clip_{len(records) + 1:03d}"
+            dst = out_dir / f"{clip_id}.mp4"
+            src_fps = meta["fps"]
+            start_frame = int(round(start_sec * src_fps))
+            end_frame = int(round(end_sec * src_fps))
+            duration = _cut_clip(src_video, dst, start_frame, end_frame, out_fps, src_fps)
+            print(
+                f"  {clip_id} <- {repo.split('/')[-1]} ep{ep['episode_index']:03d} "
+                f"[{start_sec:.1f},{end_sec:.1f})s  {duration:.1f}s  {ep['task'][:44]}"
+            )
+            records.append(
+                {
+                    "clip_id": clip_id,
+                    "source": repo,
+                    "episode_index": ep["episode_index"],
+                    "task": ep["task"],
+                    "video_file": src_video.name,
+                    "from_sec": round(start_sec, 3),
+                    "to_sec": round(end_sec, 3),
+                    "duration_sec": round(duration, 3),
+                    "fps": out_fps,
+                    "path": str(dst).replace("\\", "/"),
+                }
+            )
+            taken += 1
+
+    meta_path = out_dir / "real_clips_metadata.json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    print(f"[LeRobot] 写出 {len(records)} 个真实 clip，元数据 {meta_path}")
+
+    tasks: dict[str, int] = {}
+    for r in records:
+        tasks[r["task"]] = tasks.get(r["task"], 0) + 1
+    for t, n in sorted(tasks.items(), key=lambda kv: -kv[1]):
+        print(f"    任务分布: {n:>3}  {t}")
+    return records
+
+
+def archive_existing_clips(clip_dir: str | Path, backup_dir: str | Path) -> int:
+    """把已有 clip 移到备份目录，避免与真实数据混跑。"""
+    clip_dir, backup_dir = Path(clip_dir), Path(backup_dir)
+    if not clip_dir.exists():
+        return 0
+    exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    moved = 0
+    for p in clip_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in exts:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            target = backup_dir / p.name
+            if target.exists():
+                target.unlink()
+            shutil.move(str(p), str(target))
+            moved += 1
+    if moved:
+        print(f"[ARCHIVE] {moved} 个旧 clip 已移动到 {backup_dir}")
+    return moved
+
+
+# ---------------------------------------------------------------------------
+# 历史记录：SSv2 手动路径（自动下载已确认不可行）
+# ---------------------------------------------------------------------------
 
 SSV2_MANUAL_GUIDE = """
 ================================================================================
 Something-Something V2 (SSv2) 手动下载指南
 ================================================================================
-SSv2 当前无法通过公开镜像或 HuggingFace datasets 库自动下载完整视频。
+SSv2 无法通过公开镜像或 HuggingFace datasets 库自动下载完整视频。
 HuggingFace 上的 something_something_v2 数据集仅包含 metadata/loading script，
 脚本会明确要求 manual download；完整 19.4 GB 视频需按以下步骤获取。
 
 1. 注册并登录 Qualcomm 官方分发页面：
    https://developer.qualcomm.com/software/ai-datasets/something-something
-   （原 20bn 数据已迁移至 Qualcomm）
 
 2. 下载视频分卷（约 19 个 .rar 文件，总大小约 19.4 GB）：
-   something-something-v2-videos.part01.rar
-   something-something-v2-videos.part02.rar
-   ...
-   something-something-v2-videos.part19.rar
+   something-something-v2-videos.part01.rar ... part19.rar
 
-3. 下载标签文件：
-   something-something-v2-labels.zip
+3. 下载标签文件：something-something-v2-labels.zip
 
-4. 在本地拼接/解压（示例命令，需安装 7z 或 WinRAR）：
-   # Linux/macOS (p7zip)
-   7z x something-something-v2-videos.part01.rar
-   # Windows (7z 或 WinRAR)
+4. 本地拼接/解压（需 7z 或 WinRAR）：
    7z x something-something-v2-videos.part01.rar
 
-   解压后得到大量 WebM 短视频，即为 SSv2 原始视频。
+5. 取 validation 子集，按 id 找到对应 {id}.webm。
 
-5. 取 validation 子集（约 24,777 条）：
-   解压 labels 后，读取 validation.json，每条记录格式：
-   {"id": "12345", "template": "Dropping [something] into [something].", "label": "...", "placeholders": [...]}
-   按 id 到 video 文件夹找到对应 {id}.webm。
+6. 复制到 data/manual_clips/，再运行：
+   python src/utils/download_real_datasets.py --mode copy --src data/manual_clips
+   python src/pipeline.py real_batch --max-clips 20
 
-6. 复制 20 个 validation 视频到 data/manual_clips/，再运行：
-   PYTHONPATH=src python src/utils/download_real_datasets.py --mode copy \\
-       --src data/manual_clips --dst data/clips
-   PYTHONPATH=src python src/pipeline.py real_batch --max-clips 20
-
-7. 本脚本曾尝试的自动下载入口（预期失败，结果见日志）：
-   - HuggingFace datasets (legacy loading script) -> Not supported in datasets>=3
-   - 直接 HTTP 拉取 -> 需登录/授权，无公开直链
+如果需要真机机器人操作视频，直接用 LeRobot 自动路径即可：
+   python src/utils/download_real_datasets.py --mode lerobot \\
+       --repo lerobot/aloha_static_battery --max-clips 20
 ================================================================================
 """
 
+MANUAL_SOURCES = {
+    "something_something_v2": {
+        "display_name": "Something-Something V2 (SSv2)",
+        "url": "https://20bn.com/datasets/something-something/v2",
+        "note": "需 Qualcomm 官网注册，19 个分卷约 19.4GB",
+    },
+    "epic_kitchens_100": {
+        "display_name": "Epic-Kitchens-100",
+        "url": "https://epic-kitchens.github.io/2021",
+        "note": "需注册，clip 包约 80GB",
+    },
+    "ego4d": {
+        "display_name": "Ego4D",
+        "url": "https://ego4d-data.org/",
+        "note": "需注册并申请，数据量极大",
+    },
+}
+
 
 def print_dataset_guide(dataset: str | None = None):
-    """打印数据集获取指南。"""
-    if dataset == "something_something_v2" or dataset == "ssv2":
+    if dataset in ("something_something_v2", "ssv2"):
         print(SSV2_MANUAL_GUIDE)
         return
-
-    print("=" * 60)
-    print("真实开源机器人/操作视频数据集获取指南")
-    print("=" * 60)
-    for name, info in SUPPORTED_SOURCES.items():
-        marker = "★ 推荐" if info["recommended"] else ""
-        print(f"\n{info['display_name']} ({name}): {marker}")
-        print(f"  官网/下载: {info['url']}")
-        print(f"  说明: {info['note']}")
-    print("\n操作步骤：")
-    print("1. 手动下载上述任一数据集的 MP4/WebM 文件")
-    print("2. 将视频放入 data/manual_clips/ 目录")
-    print("3. 运行: PYTHONPATH=src python src/utils/download_real_datasets.py --mode copy")
-    print("4. 运行: PYTHONPATH=src python src/pipeline.py real_batch --max-clips 20")
-    print("=" * 60)
-
-
-def _ensure_hf_endpoint():
-    """若环境未设置 HF endpoint，尝试使用 hf-mirror.com。"""
-    if not os.environ.get("HF_ENDPOINT"):
-        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-        print(f"[INFO] 已设置 HF_ENDPOINT={os.environ['HF_ENDPOINT']}")
-
-
-def _report_failure(dataset: str, reason: str, log_path: Path | None = None):
-    """统一记录自动下载失败信息。"""
-    msg = (
-        f"[FAIL] 自动下载 {dataset} 失败。\n"
-        f"       原因: {reason}\n"
-        f"       请使用手动下载指南: --mode guide --dataset {dataset}"
-    )
-    print(msg)
-    if log_path:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-
-
-def _try_download_ssv2_hf(out_dir: Path, max_clips: int = 20) -> list[Path]:
-    """
-    尝试通过 HuggingFace datasets 加载 SSv2 validation 子集。
-    预期会失败：该数据集使用 legacy loading script 且要求 manual download。
-    """
-    _ensure_hf_endpoint()
-    print("[SSv2] 尝试 HuggingFace datasets 自动加载...")
-    try:
-        # 延迟导入，避免 datasets 不在环境中时脚本完全不可用
-        from datasets import load_dataset
-    except ImportError as e:
-        raise RuntimeError(f"未安装 datasets 库: {e}")
-
-    ds_name = "HuggingFaceM4/something_something_v2"
-    print(f"[SSv2] load_dataset('{ds_name}', split='validation', streaming=True)")
-    try:
-        ds = load_dataset(ds_name, split="validation", streaming=True)
-    except Exception as e:
-        raise RuntimeError(f"HuggingFace datasets 加载失败: {e}")
-
-    # 如果加载成功，尝试保存视频（理论上不会走到这里）
-    out_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[Path] = []
-    for i, sample in enumerate(ds):
-        if i >= max_clips:
-            break
-        clip_id = sample.get("id", f"ssv2_{i:05d}")
-        video = sample.get("video")
-        if video is None:
-            continue
-        dst = out_dir / f"real_clip_{i+1:03d}.mp4"
-        # streaming 返回的可能是 bytes/path，这里做最小兼容
-        if isinstance(video, bytes):
-            dst.write_bytes(video)
-        elif isinstance(video, (str, Path)):
-            shutil.copy2(video, dst)
-        else:
-            continue
-        saved.append(dst)
-        print(f"[SSv2] saved {dst}")
-    return saved
-
-
-def _try_download_ssv2_http(out_dir: Path, max_clips: int = 20) -> list[Path]:
-    """
-    尝试通过公开 HTTP 直链下载 SSv2 视频。
-    预期会失败：SSv2 无公开直链，需登录授权。
-    """
-    print("[SSv2] 尝试公开 HTTP 直链下载...")
-    raise RuntimeError("SSv2 无公开 HTTP 直链；需注册 Qualcomm 官网后手动下载。")
-
-
-def download_ssv2(
-    out_dir: str | Path = "data/clips",
-    max_clips: int = 20,
-    method: str = "hf",
-) -> list[Path]:
-    """
-    尝试自动下载 SSv2 validation 子集。
-    若失败，打印详细手动下载指南并记录失败原因。
-    """
-    out_dir = Path(out_dir)
-    log_path = out_dir.parent / "logs" / "ssv2_download.log"
-
-    try:
-        if method == "hf":
-            return _try_download_ssv2_hf(out_dir, max_clips)
-        elif method == "http":
-            return _try_download_ssv2_http(out_dir, max_clips)
-        else:
-            raise ValueError(f"未知下载方法: {method}")
-    except Exception as e:
-        _report_failure("something_something_v2", str(e), log_path)
-        raise
+    print("=" * 64)
+    print("真实视频数据获取指南")
+    print("=" * 64)
+    print("\n【自动路径】LeRobot 真机机器人操作数据集")
+    print(f"  默认数据源: {DEFAULT_REPO}")
+    print("  运行: python src/utils/download_real_datasets.py --mode lerobot --max-clips 20")
+    print("  可选真机任务: aloha_static_coffee / candy / tape / towel / ziploc_slide 等")
+    print("\n【手动路径】需注册的数据集")
+    for name, info in MANUAL_SOURCES.items():
+        print(f"\n  {info['display_name']} ({name})")
+        print(f"    下载: {info['url']}")
+        print(f"    说明: {info['note']}")
+    print("\n步骤：放入 data/manual_clips/ 后运行 --mode copy，再运行 src/pipeline.py")
+    print("=" * 64)
 
 
 def copy_manual_clips(src_dir: Path, dst_dir: Path, max_clips: int = 20) -> list[Path]:
-    """复制用户手动放置的真实视频到统一目录。"""
+    """复制手动放置的真实视频到统一目录。"""
     dst_dir.mkdir(parents=True, exist_ok=True)
-    # 清空目标目录
-    for p in dst_dir.iterdir():
-        if p.is_file():
-            p.unlink()
-
-    src_dir = Path(src_dir)
-    supported_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    supported = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     clips = sorted(
-        p for p in src_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in supported_exts
+        p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in supported
     )[:max_clips]
-
     copied = []
     for i, clip in enumerate(clips, 1):
-        new_name = f"real_clip_{i:03d}{clip.suffix}"
-        dst = dst_dir / new_name
+        dst = dst_dir / f"real_clip_{i:03d}{clip.suffix}"
         shutil.copy2(clip, dst)
         copied.append(dst)
-
     return copied
 
 
 def run_synthetic_fallback(num: int = 20):
-    """当没有真实数据时，生成高保真合成视频。"""
-    import sys
-
-    sys.path.insert(0, "src/utils")
+    """没有真实数据时的兜底：生成高保真合成视频（仅用于回归测试）。"""
+    sys.path.insert(0, str(Path(__file__).parent))
     from generate_realistic_robot_clips import generate_robot_clip
 
     out_dir = Path("data/clips")
     out_dir.mkdir(parents=True, exist_ok=True)
     metadata = []
     for i in range(num):
-        clip_path = out_dir / f"robot_clip_{i+1:03d}.mp4"
+        clip_path = out_dir / f"robot_clip_{i + 1:03d}.mp4"
         info = generate_robot_clip(clip_path)
         info["path"] = str(clip_path)
         info["clip_id"] = clip_path.stem
         metadata.append(info)
         print(f"Generated: {clip_path} | action={info['action']} | shape={info['shape']}")
-
-    meta_path = out_dir / "robot_clips_metadata.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
+    with open(out_dir / "robot_clips_metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
-    print(f"Synthetic fallback generated {num} clips in {out_dir}")
+
+
+def load_data_config(path: str | Path = "configs/data_config.yaml") -> dict:
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 def main():
     parser = argparse.ArgumentParser(description="真实视频数据集准备工具")
     parser.add_argument(
         "--mode",
-        choices=["guide", "copy", "synthetic", "download"],
+        choices=["guide", "copy", "synthetic", "lerobot"],
         default="guide",
-        help=(
-            "guide: 打印获取指南; copy: 复制手动下载的视频; "
-            "synthetic: 生成高保真合成视频; download: 尝试自动下载（可能失败）"
-        ),
+        help="guide: 获取指南; lerobot: 自动下载真机数据; copy: 复制手动数据; synthetic: 合成兜底",
     )
+    parser.add_argument("--dataset", type=str, default="lerobot", help="guide 模式下的数据集名")
     parser.add_argument(
-        "--dataset",
+        "--repo",
         type=str,
-        default="something_something_v2",
-        choices=list(SUPPORTED_SOURCES.keys()) + ["ssv2"],
-        help="目标数据集（仅 download/guide 模式使用）",
+        default=DEFAULT_REPO,
+        help="LeRobot 数据集仓库，可用逗号分隔多个以组成多任务 clip 集",
     )
     parser.add_argument("--src", type=str, default="data/manual_clips", help="手动视频源目录")
     parser.add_argument("--dst", type=str, default="data/clips", help="目标目录")
     parser.add_argument("--max-clips", type=int, default=20, help="最大 clip 数")
+    parser.add_argument("--max-duration", type=float, default=15.0, help="单个 clip 最长秒数")
+    parser.add_argument("--out-fps", type=float, default=10.0, help="输出 clip 帧率")
     parser.add_argument(
-        "--method",
-        type=str,
-        default="hf",
-        choices=["hf", "http"],
-        help="download 模式下的下载方法",
+        "--keep-existing", action="store_true", help="保留 clips 目录中已有的视频"
     )
     args = parser.parse_args()
 
@@ -310,15 +480,16 @@ def main():
         print(f"Copied {len(copied)} clips to {args.dst}")
     elif args.mode == "synthetic":
         run_synthetic_fallback(args.max_clips)
-    elif args.mode == "download":
-        if args.dataset in ("something_something_v2", "ssv2"):
-            try:
-                download_ssv2(args.dst, args.max_clips, method=args.method)
-            except RuntimeError as e:
-                print(f"\n{e}")
-                sys.exit(1)
-        else:
-            print(f"[WARN] 暂不支持自动下载 {args.dataset}，请使用 --mode guide --dataset {args.dataset}")
+    elif args.mode == "lerobot":
+        if not args.keep_existing:
+            archive_existing_clips(args.dst, Path(args.dst).parent / "clips_synthetic_backup")
+        fetch_lerobot_clips(
+            repos=args.repo,
+            out_dir=args.dst,
+            max_clips=args.max_clips,
+            max_duration=args.max_duration,
+            out_fps=args.out_fps,
+        )
 
 
 if __name__ == "__main__":
